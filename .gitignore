@@ -53,3 +53,7 @@ logs/
 # @en Cache files
 # @zh 编译工具缓存
 *.cache
+
+# OpenCode deepwork notes
+.slim/deepwork/
+/dist

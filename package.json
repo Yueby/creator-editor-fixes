@@ -1,23 +1,27 @@
 {
-    "$schema": "./@types/schema/package/index.json",
     "package_version": 2,
-    "name": "prefab-transform-override-fixer",
-    "version": "1.0.0",
+    "name": "creator-editor-fixes",
+    "version": "1.0.13",
     "author": "Yueby",
     "editor": ">=3.8.3",
     "scripts": {
-        "preinstall": "node ./scripts/preinstall.js",
-        "build": "tsc",
+        "build": "node ./scripts/clean-dist.js && tsc && node ./scripts/package-dist.js",
         "watch": "tsc -w"
     },
-    "description": "i18n:prefab-transform-override-fixer.description",
+    "description": "Cocos Creator 编辑器修复集合，包含 prefab 根节点 Transform override 同步修复与 Inspector i18n 监听泄漏修复。",
     "main": "./dist/main.js",
+    "creator": {
+        "hookScript": "./dist/fixes/inspector-i18n-listener-leak/hook.js"
+    },
     "devDependencies": {
         "@cocos/creator-types": "^3.8.3",
         "@types/node": "^18.17.1",
         "typescript": "^4.3.4"
     },
     "contributions": {
+        "scene": {
+            "script": "./dist/scene.js"
+        },
         "messages": {
             "scene:ready": {
                 "methods": [
@@ -29,21 +33,19 @@
                     "onSceneClose"
                 ]
             },
-            "scene:add-node": {
+            "getPrefabChildLockStates": {
                 "methods": [
-                    "onSceneAddNode"
+                    "getPrefabChildLockStates"
                 ]
             },
-            "scene:change-node": {
+            "savePrefabChildLockStates": {
                 "methods": [
-                    "onSceneChangeNode"
-                ]
-            },
-            "scene:remove-node": {
-                "methods": [
-                    "onSceneRemoveNode"
+                    "savePrefabChildLockStates"
                 ]
             }
+        },
+        "inspector": {
+            "type": {}
         }
     }
 }
