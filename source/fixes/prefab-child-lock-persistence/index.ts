@@ -1,9 +1,12 @@
-import { debugWarn } from '../../debug';
+import { debugWarn, warnOnce } from '../../debug';
+import { getEditorVersion, isSupportedEditorVersion, SUPPORTED_EDITOR_VERSION } from '../../editor-version';
 
 const PACKAGE_NAME = 'creator-editor-fixes';
-const PATCH_VERSION = 'prefab-child-lock-persistence-v4';
+const PATCH_VERSION = 'prefab-child-lock-persistence-v5';
 const STATE_KEY = '__prefabChildLockPersistenceState__';
 const PATCHED_FLAG = '__prefabChildLockPersistencePatched__';
+/** owner -> child 的 fileId 路径分隔符，fileId 自身不含该字符。 */
+const CHILD_KEY_SEPARATOR = '/';
 
 interface PatchRecord {
     target: any;
@@ -121,11 +124,47 @@ function collectTargets(uuids: any, loop: any): any[] {
     return targets;
 }
 
+// 嵌套 prefab 下，子节点自身的 fileId 只在它所属的 prefab 资源内唯一，
+// 同一个外层实例里多个相同嵌套 prefab 的同名子节点会拿到相同 fileId。
+// 引擎把 TargetInfo.localID 定义为 string[] 就是为了表达这种多级路径，
+// 所以持久化 key 也用 owner -> child 的完整 fileId 路径，避免碰撞。
+function getChildFileIdPath(node: any, owner: any): string[] | null {
+    const path: string[] = [];
+    let current = node;
+    while (current && current !== owner) {
+        const localId = getPrefabLocalId(current);
+        if (localId === undefined || localId === null || localId === '') return null;
+        path.unshift(String(localId));
+        if (path.length > 64) return null;
+        current = getParent(current);
+    }
+    return current === owner && path.length > 0 ? path : null;
+}
+
+function getChildKey(path: string[]): string {
+    return path.join(CHILD_KEY_SEPARATOR);
+}
+
+// v5 之前的记录只用子节点自身 fileId 作 key，这里做一次向后兼容读取，
+// 避免升级后已有的锁定状态全部丢失。
+function readLockedRecord(rootMap: any, childPath: string[]): boolean | undefined {
+    if (!rootMap) return undefined;
+    const pathKey = getChildKey(childPath);
+    const pathValue = rootMap[pathKey];
+    if (typeof pathValue === 'boolean') return pathValue;
+    const legacyKey = childPath[childPath.length - 1];
+    if (legacyKey === pathKey) return undefined;
+    const legacyValue = rootMap[legacyKey];
+    return typeof legacyValue === 'boolean' ? legacyValue : undefined;
+}
+
 function getLocked(node: any): boolean | undefined {
     try {
+        // 3.8.3 的引擎 Node 没有 locked 属性，这里只是前向兼容；
+        // 实际生效的是下面的 _objFlags & LockedInEditor(1 << 9)。
         if (typeof node.locked === 'boolean') return node.locked;
     } catch (_error) {
-        // Read the editor flag when the public property is unavailable.
+        // 公开属性不可用时读编辑器标志位。
     }
     try {
         const flags = node && node._objFlags;
@@ -146,15 +185,16 @@ function persistTargets(targets: any[]): void {
     const changes: any[] = [];
     for (const node of targets) {
         const owner = findOwner(node);
-        const localId = getPrefabLocalId(node);
         // 只排除顶层预制体根节点与普通节点（无预制体 owner，锁定由 Creator 原生序列化）。
         // 嵌套预制体根节点自身 isPrefabInstanceRoot=true，但它是外层预制体的子节点，锁定不会被原生保存，仍需持久化。
-        if (!owner || localId === undefined || localId === null || localId === '') continue;
+        if (!owner) continue;
         const ownerFileId = getPrefabInstanceFileId(owner);
         if (!ownerFileId) continue;
+        const childPath = getChildFileIdPath(node, owner);
+        if (!childPath) continue;
         const locked = getLocked(node);
         if (locked === undefined) continue;
-        changes.push({ prefabRootFileId: ownerFileId, childFileId: String(localId), locked });
+        changes.push({ prefabRootFileId: ownerFileId, childFileId: getChildKey(childPath), locked });
     }
     const sceneUuid = getSceneUuid();
     if (!sceneUuid || !changes.length) return;
@@ -177,26 +217,30 @@ async function restoreStates(): Promise<void> {
     const sceneUuid = getSceneUuid();
     if (!sceneUuid) return;
     const root = globalThis as any;
-    const map = await root.Editor.Message.request(PACKAGE_NAME, 'getPrefabChildLockStates');
-    const sceneMap = map && map.scenes && map.scenes[sceneUuid];
-    if (!sceneMap) return;
-    const nodeManager = root.cce && root.cce.Node;
-    if (!nodeManager || typeof nodeManager.changeNodeLock !== 'function') return;
-    const sceneRoot = root.cce && root.cce.Scene && readField(root.cce.Scene, 'rootNode');
-    const visit = async (node: any): Promise<void> => {
-        if (!node) return;
-        const owner = findOwner(node);
-        const localId = getPrefabLocalId(node);
-        const ownerFileId = owner ? getPrefabInstanceFileId(owner) : '';
-        if (ownerFileId && localId !== undefined && localId !== null && localId !== '') {
-            const rootMap = sceneMap[ownerFileId];
-            const locked = rootMap && rootMap[String(localId)];
-            if (typeof locked === 'boolean') await Promise.resolve(nodeManager.changeNodeLock(getUuid(node), locked, false));
-        }
-        for (const child of getChildren(node)) await visit(child);
-    };
+    // 先置位再 await：否则两次 scene:ready 能在读 profile 的窗口里同时穿过守卫。
     state.restoring = true;
-    try { await visit(sceneRoot); } finally { state.restoring = false; }
+    try {
+        const map = await root.Editor.Message.request(PACKAGE_NAME, 'getPrefabChildLockStates');
+        const sceneMap = map && map.scenes && map.scenes[sceneUuid];
+        if (!sceneMap) return;
+        const nodeManager = root.cce && root.cce.Node;
+        if (!nodeManager || typeof nodeManager.changeNodeLock !== 'function') return;
+        const sceneRoot = root.cce && root.cce.Scene && readField(root.cce.Scene, 'rootNode');
+        const visit = async (node: any): Promise<void> => {
+            if (!node) return;
+            const owner = findOwner(node);
+            const ownerFileId = owner ? getPrefabInstanceFileId(owner) : '';
+            if (ownerFileId) {
+                const childPath = getChildFileIdPath(node, owner);
+                const locked = childPath ? readLockedRecord(sceneMap[ownerFileId], childPath) : undefined;
+                if (typeof locked === 'boolean') await Promise.resolve(nodeManager.changeNodeLock(getUuid(node), locked, false));
+            }
+            for (const child of getChildren(node)) await visit(child);
+        };
+        await visit(sceneRoot);
+    } finally {
+        state.restoring = false;
+    }
 }
 
 function unwrap(method: any): any {
@@ -210,15 +254,9 @@ function patchMethod(target: any, key: string): boolean {
     if (typeof original !== 'function') return false;
 
     const wrapped = function patchedChangeNodeLock(this: any, ...args: any[]): any {
-        const targets = collectTargets(args[0], args[2]);
         if (getState().restoring) return original.apply(this, args);
-        let result: any;
-        try {
-            result = original.apply(this, args);
-        } catch (error) {
-            throw error;
-        }
-
+        const targets = collectTargets(args[0], args[2]);
+        const result = original.apply(this, args);
         const then = result && result.then;
         if (typeof then === 'function') {
             return then.call(result, (value: any) => {
@@ -254,8 +292,21 @@ function getGeneralSceneFacade(): any {
 
 export async function installEditorHooks(): Promise<void> {
     await uninstallEditorHooks();
+    if (!isSupportedEditorVersion()) {
+        warnOnce(
+            `${PACKAGE_NAME}:${PATCH_VERSION}:unsupported-version`,
+            `[${PACKAGE_NAME}][${PATCH_VERSION}] 跳过安装：仅适用于编辑器 ${SUPPORTED_EDITOR_VERSION}，当前 ${getEditorVersion() || 'unknown'}`,
+        );
+        return;
+    }
     const facade = getGeneralSceneFacade();
     const installed = patchMethod(facade && facade.prototype, 'changeNodeLock');
+    if (!installed) {
+        warnOnce(
+            `${PACKAGE_NAME}:${PATCH_VERSION}:patch-failed`,
+            `[${PACKAGE_NAME}][${PATCH_VERSION}] 未能 hook GeneralSceneFacade.changeNodeLock，prefab 子节点锁定不会被持久化`,
+        );
+    }
     getState().installed = installed;
 }
 

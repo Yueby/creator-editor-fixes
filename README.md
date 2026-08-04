@@ -6,10 +6,13 @@
 
 ```text
 prefab-root-transform-override
+prefab-child-lock-persistence
 inspector-i18n-listener-leak
 ```
 
 该模块修复 prefab 实例根节点在编辑器内调整父节点后，Transform override 保存、切换场景、撤销/重做状态不一致的问题。
+
+`prefab-child-lock-persistence` 让 prefab 实例内子节点的编辑器锁定状态（`LockedInEditor`）可以跨场景重载、跨编辑器重启保留，因为 Creator 原生不会把它序列化进场景。
 
 `inspector-i18n-listener-leak` 修复 Cocos Creator 3.8.3 Inspector 面板切换时 `i18n:change` 广播监听未随面板释放的问题，尤其可降低多材质 MeshRenderer 等 Inspector 反复打开后的内存增长。
 
@@ -45,8 +48,10 @@ inspector-i18n-listener-leak
 当前主方案版本：
 
 ```text
-override-recording-v5
+override-recording-v6
 ```
+
+prefab 根节点 override 条目的定位使用引擎自带的 EDITOR-only API `PrefabInstance.findPropertyOverride([fileId], [transformKey])`，语义与序列化端的 `compareStringArray` 一致；该 API 不可用时回退到等价的严格数组比较，不做 `includes` 宽松匹配，避免命中嵌套 prefab 的多级 `localID` 或 `['_lpos','x']` 这类分量级 override。
 
 Inspector i18n 监听泄漏修复使用 `creator.hookScript` 仅在 `Editor.App.version === '3.8.3'` 时动态注入：
 
@@ -60,8 +65,10 @@ contributions.inspector.type.node  -> dist/fixes/inspector-i18n-listener-leak/no
 扩展版本：
 
 ```text
-1.0.13
+1.0.14
 ```
+
+scene 进程的两个 hook 模块（`prefab-root-transform-override`、`prefab-child-lock-persistence`）只在 `Editor.App.version === '3.8.3'` 时安装；其它版本会输出一次 warning 后跳过，不会把 patch 打在未验证过的内部实现上。
 
 ## 使用到的编辑器内部 hook
 
@@ -69,6 +76,7 @@ contributions.inspector.type.node  -> dist/fixes/inspector-i18n-listener-leak/no
 
 ```text
 GeneralSceneFacade.prototype.setNodeParent
+GeneralSceneFacade.prototype.changeNodeLock
 SceneUndoManager.prototype.beginRecording
 SceneUndoManager.prototype.endRecording
 SceneUndoCommand.prototype.applyData
@@ -76,7 +84,7 @@ SceneUndoCommand.prototype.undo
 SceneUndoCommand.prototype.redo
 ```
 
-这些 hook 只在编辑器内生效，不影响游戏运行时。
+这些 hook 只在编辑器内生效，不影响游戏运行时。扩展被禁用或卸载时，`main.ts` 会通过 scene 脚本调用 `uninstallEditorHooks`，把上面所有方法还原，不留残留 wrapper。
 
 ## 安全边界
 
@@ -90,7 +98,10 @@ SceneUndoCommand.prototype.redo
 - 不使用延迟定时器修补 Transform。
 - 不直接写入 scene/prefab 文件。
 - 不新增 prefab override 条目。
+- 不在非 3.8.3 的编辑器上安装任何 scene hook。
 - Inspector 修复不贡献 header/section/footer，仅覆盖 `type.asset` 与 `type.node`。
+
+已知限制：Inspector 修复通过 `contributions.inspector.type.asset` / `type.node` 生效，与其它同样覆盖这两个 key 的扩展互斥（后加载者生效）。
 
 插件只会在原始 set-parent recording 内，更新 prefab 根节点已经存在的 Transform override 条目：
 
@@ -108,13 +119,17 @@ _lscale
 ```text
 creator-editor-fixes/
 ├─ source/
-│  ├─ main.ts                                # 编辑器主进程入口，负责安装 scene hook
+│  ├─ main.ts                                # 编辑器主进程入口，负责安装/卸载 scene hook
 │  ├─ scene.ts                               # scene 进程入口，委托到修复模块
-│  ├─ debug.ts                               # Debug 日志开关
+│  ├─ debug.ts                               # Debug 日志开关 + 关键失败 warnOnce
+│  ├─ editor-version.ts                      # 统一的 3.8.3 版本守卫
 │  └─ fixes/
-│     ├─ prefab-root-transform-override/     # override-recording-v5 修复
+│     ├─ prefab-root-transform-override/     # override-recording-v6 修复
 │     │  ├─ index.ts
-│     │  └─ README.md                        # override-recording-v5 修复原理
+│     │  └─ README.md                        # override-recording-v6 修复原理
+│     ├─ prefab-child-lock-persistence/      # prefab 子节点锁定持久化
+│     │  ├─ index.ts
+│     │  └─ README.md                        # 持久化方案与限制
 │     └─ inspector-i18n-listener-leak/       # Inspector i18n 监听泄漏修复
 │        ├─ hook.ts
 │        ├─ patcher.ts
@@ -122,21 +137,27 @@ creator-editor-fixes/
 │        ├─ node.ts
 │        └─ README.md                        # Inspector 修复原理
 ├─ scripts/
+│  ├─ clean-dist.js
 │  ├─ package-dist.js
-│  └─ verify-inspector-i18n-listener-leak.js
+│  ├─ check-target-overrides.js              # 项目体检：prefab 跨节点引用（targetOverrides）是否断链
+│  ├─ verify-scene-fixes.js                  # scene hook 离线冒烟测试（不需要 Creator）
+│  ├─ verify-inspector-i18n-listener-leak.js # Inspector 精确替换静态校验
+│  └─ verify-editor-internals.js             # 校验 hook 依赖的编辑器内部 API 是否仍成立
 ├─ dist/
 │  ├─ main.js
 │  ├─ scene.js
 │  ├─ debug.js
+│  ├─ editor-version.js
 │  ├─ fixes/
-│  │  ├─ prefab-root-transform-override.js
+│  │  ├─ prefab-root-transform-override/index.js
+│  │  ├─ prefab-child-lock-persistence/index.js
 │  │  └─ inspector-i18n-listener-leak/
 │  │     ├─ hook.js
 │  │     ├─ patcher.js
 │  │     ├─ asset.js
 │  │     └─ node.js
 │  ├─ package.json
-│  └─ creator-editor-fixes-1.0.13.zip
+│  └─ creator-editor-fixes-1.0.14.zip
 ├─ package.json
 ├─ package-lock.json
 └─ tsconfig.json
@@ -159,6 +180,7 @@ creator-editor-fixes/
 
 ```text
 source/fixes/prefab-root-transform-override/README.md
+source/fixes/prefab-child-lock-persistence/README.md
 source/fixes/inspector-i18n-listener-leak/README.md
 ```
 
@@ -178,14 +200,29 @@ npm run build
 
 构建会执行：
 
-1. TypeScript 编译。
-2. 生成发布用 `dist/package.json`。
-3. 生成可导入编辑器的 zip 包。
+1. 清理 `dist/`。
+2. TypeScript 编译（去注释、不带 sourcemap）。
+3. 生成发布用 `dist/package.json`。
+4. 生成 deflate 压缩的 zip 包，并逐条解压比对 CRC 与字节自检。
+
+需要跟 dist 产物断点调试时用带 sourcemap 的构建（体积约 3.5 倍）：
+
+```bash
+npm run build:debug   # tsc -p tsconfig.debug.json
+npm run watch         # 监听模式同样用 tsconfig.debug.json
+```
+
+两种构建的体积对比：
+
+| 构建 | dist 内 js 合计 | zip |
+| --- | --- | --- |
+| `npm run build`（发布） | 约 58 KB | 约 17 KB |
+| `npm run build:debug`（排查） | 约 209 KB | 约 66 KB |
 
 构建产物：
 
 ```text
-dist/creator-editor-fixes-1.0.13.zip
+dist/creator-editor-fixes-1.0.14.zip
 ```
 
 zip 内包含：
@@ -194,7 +231,9 @@ zip 内包含：
 main.js
 scene.js
 debug.js
+editor-version.js
 fixes/prefab-root-transform-override/index.js
+fixes/prefab-child-lock-persistence/index.js
 fixes/inspector-i18n-listener-leak/hook.js
 fixes/inspector-i18n-listener-leak/patcher.js
 fixes/inspector-i18n-listener-leak/asset.js
@@ -206,47 +245,68 @@ package.json
 
 默认不输出修复命中、校验、uuid 列表等调试日志，避免影响编辑器控制台性能。
 
-如需排查问题，可修改：
-
-```text
-source/debug.ts
-```
-
-将：
-
-```ts
-export const DEBUG = false;
-```
-
-改为：
-
-```ts
-export const DEBUG = true;
-```
-
-然后重新执行：
+如需排查问题，可修改 `source/debug.ts` 里的 `export const DEBUG = false;` 为 `true`，然后重新构建（排查场景建议用带 sourcemap 的那个）：
 
 ```bash
-npm run build
+npm run build:debug
 ```
 
-也可以在对应进程中临时设置全局标记：
+也可以在对应进程中临时设置全局标记（scene 进程的日志需要在场景调试窗口里设）：
 
 ```js
 globalThis.__creatorEditorFixesDebug__ = true;
 ```
+
+与普通调试日志不同，以下关键失败不受 DEBUG 开关控制，会用 `console.warn` 输出一次（同一原因不重复刷屏）：
+
+```text
+编辑器版本不是 3.8.3，跳过安装
+未找到 scene 包路径 / 内部实现（GeneralSceneFacade、SceneUndoManager、SceneUndoCommand）
+部分 hook 未安装（installed=n/6）
+未找到 _setUndo / _setRedo
+未能 hook changeNodeLock
+Inspector 精确替换匹配次数异常、内存补丁加载失败
+undo/redo 超时未结束，applying 计数已兜底恢复
+```
+
+看到这些 warning 就意味着对应修复没生效，而不是静默失败。
 
 ## 导入编辑器
 
 在 Cocos Creator 扩展管理器中导入：
 
 ```text
-dist/creator-editor-fixes-1.0.13.zip
+dist/creator-editor-fixes-1.0.14.zip
 ```
 
 导入后重启或重载扩展，使 scene hook 生效。
 
 ## 验证方式
+
+### 一次跑完所有自动校验
+
+```bash
+npm run build
+npm run verify
+```
+
+如本机 Creator 3.8.3 不在默认位置，先设置（Windows cmd 用 `set`，bash 用 `export`）：
+
+```bash
+export COCOS_CREATOR_383_PATH=/c/ProgramData/cocos/editors/Creator/3.8.3
+```
+
+`npm run verify` 依次执行三个脚本：
+
+| 脚本 | 验证内容 | 是否需要安装 Creator |
+| --- | --- | --- |
+| `scripts/verify-scene-fixes.js` | 用假的 `SceneUndoManager` / `SceneUndoCommand` / `GeneralSceneFacade` / `cce` 真跑 dist：uuids 传 string、override 严格匹配、干扰条目不被误伤、redoData 同步、child-first 顺序、endRecording 收到无关 id、锁定 key 路径化与 v4 旧数据兼容、restore 不回写、uninstall 还原、版本守卫 | 不需要 |
+| `scripts/verify-inspector-i18n-listener-leak.js` | Inspector 四处精确替换在 3.8.3 原文中各匹配 1 次、hookScript 注入与版本守卫、`Editor.App.path=app.asar` 时的路径推导 | 需要 |
+| `scripts/verify-editor-internals.js` | 解包 `app.asar`，校验 hook 依赖的内部签名（`_setUndo`/`_setRedo`/`applyData`/`setNodeParent`/`changeNodeLock`/`cce.Node.query`/`rootNode`）、`CutNodeOptions.uuids: string \| string[]`、引擎字段（`localID: string[]`、`propertyPath: string[]`、`findPropertyOverride`、`_lpos/_lrot/_euler/_lscale`、`LockedInEditor = 1 << 9`）、Inspector 原始泄漏点仍成立、dist 已按当前 source 重新构建 | 需要 |
+
+升级 Creator 后只要跑 `npm run verify`，就能知道哪一条内部假设失效了，不用先手工试。
+
+### prefab 根节点 Transform override
 
 建议使用一个带非默认 Transform 的父节点 `Parent` 测试：
 
@@ -257,28 +317,49 @@ dist/creator-editor-fixes-1.0.13.zip
 5. 测试 Ctrl+Z / Ctrl+Y，确认父子关系与位置都正确。
 6. 多选多个 prefab 实例根节点重复上述操作。
 
-日志中应能看到类似信息：
+### prefab 子节点锁定持久化
+
+1. 锁定 prefab 实例内的一个子节点，切换场景再切回，确认仍然锁定。
+2. 单独解锁该子节点，重载后确认仍然解锁。
+3. 嵌套 prefab：同一个外层实例里放两份相同的嵌套 prefab，只锁其中一份的子节点，确认另一份不跟着变。
+4. 锁定顶层 prefab 根节点，确认不写入项目 Profile（该状态由 Creator 原生序列化）。
+
+### 日志确认
+
+打开 debug 后，日志中应能看到类似信息：
 
 ```text
-[creator-editor-fixes][override-recording-v5] 已安装 override recording 最小修复
-[creator-editor-fixes][override-recording-v5] 已将 prefab 根节点加入当前 set-parent 记录 count=...
-[creator-editor-fixes][override-recording-v5] 已同步 prefab 根节点已有 Transform 覆盖 count=...
+[creator-editor-fixes][override-recording-v6] 已安装 override recording 最小修复
+[creator-editor-fixes][override-recording-v6] 已将 prefab 根节点加入当前 set-parent 记录 count=...
+[creator-editor-fixes][override-recording-v6] 已同步 prefab 根节点已有 Transform 覆盖 count=...
 [creator-editor-fixes][inspector-i18n-listener-leak] 已注入 Inspector i18n 监听泄漏修复 ...
 [creator-editor-fixes][inspector-i18n-listener-leak] 已加载内存补丁 asset.js
 [creator-editor-fixes][inspector-i18n-listener-leak] 已加载内存补丁 node.js
 ```
 
-可执行静态校验：
+Inspector 泄漏修复的效果可以在 Chrome DevTools 的 Memory 面板里看：反复选中/取消选中多材质 MeshRenderer 节点后手动 GC，堆快照里不应再看到持续增长的 `i18n:change` 监听闭包。
+
+## 附带工具：prefab 跨节点引用体检
+
+除了三个修复模块，仓库里还有一个面向**业务项目**的只读体检工具，用于查 Creator 3.8.3 上那个古老的坑：脚本引用 prefab 实例内部的节点/组件（序列化为 `cc.TargetOverrideInfo`），偶发在重新打开场景后变成 `null`，而编辑器和运行时都不报错。
 
 ```bash
-node scripts/verify-inspector-i18n-listener-leak.js
+npm run check:refs -- "E:/path/to/CocosProject"                       # 扫全部 .scene 与 .prefab
+npm run check:refs -- "E:/path/to/CocosProject" --scene               # 只扫场景
+npm run check:refs -- "E:/path/to/CocosProject/assets/x.scene" --verbose
 ```
 
-如本机 Creator 3.8.3 不在默认位置，请先设置：
+它不靠猜，而是把引擎的恢复流程整个复刻了一遇：`applyTargetOverrides` 的每个 `continue`/`return` 分支、`generateTargetMap` 的层级规则、`createNodeWithPrefab` 从 asset 重建子树的行为、`applyMountedChildren` 向 targetMap 补登记的时机。因此能区分三类结果：
 
-```bash
-set COCOS_CREATOR_383_PATH=C:\ProgramData\cocos\editors\Creator\3.8.3
-```
+| 分类 | 含义 |
+| --- | --- |
+| `ok` | 能被引擎正确恢复，并给出目标（`player.prefab -> component backpack_full_tip/...`） |
+| `BAD` | 运行时必然为 `null`，并指出原因（source/sourceInfo 皮空、target 为 null、localID 断链、localID 层级不符并给出正确层级……） |
+| 无害脏数据 | 挂在 prefab 实例根节点上的 `targetOverrides`。引擎从不读它们（`applyTargetOverrides` 不递归子节点），单独计数以免污染真问题 |
+
+报告里会把脚本的压缩 uuid 解回文件名（`64329eme4BCvIqYi7uZZt2h` → `ItemPanel.ts`），并给出节点全路径，方便直接在 Inspector 里找到字段重拖。存在 BAD 时退出码为 1，可接 CI。
+
+背景、引擎源码依据与已排除/已实证的假设看 `ISSUE-prefab-target-overrides-lost.md`。
 
 ## 适用版本
 
@@ -288,4 +369,4 @@ set COCOS_CREATOR_383_PATH=C:\ProgramData\cocos\editors\Creator\3.8.3
 Cocos Creator 3.8.3
 ```
 
-其他版本的 Creator 内部 scene/undo 实现可能不同，不保证兼容。
+其他版本的 Creator 内部 scene/undo 实现可能不同，所以三个修复都带硬版本守卫：`Editor.App.version` 不等于 `3.8.3` 时，Inspector 包装不注入、scene hook 不安装，并输出一次 warning。升级编辑器后要先把 `source/editor-version.ts` 里的 `SUPPORTED_EDITOR_VERSION` 改成新版本并跑 `npm run verify`，确认内部 API 没变再启用。

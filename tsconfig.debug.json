@@ -1,0 +1,10 @@
+{
+    // 排查用配置：产物带内联 sourcemap 与注释，体积约为发布产物的 3.5 倍。
+    // 发布走 tsconfig.json（npm run build），排查走 npm run build:debug / npm run watch。
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "inlineSourceMap": true,
+        "inlineSources": true,
+        "removeComments": false
+    }
+}

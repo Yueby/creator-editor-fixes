@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
 const DIST_DIR = path.join(PACKAGE_ROOT, 'dist');
@@ -57,42 +58,54 @@ function getDosTime(date) {
     return { dosTime, dosDate };
 }
 
+/** deflate 压缩；压不下去（小文件）就退回 store，避免反而变大。 */
+function compressEntry(data) {
+    if (data.length === 0) return { method: 0, payload: data };
+    const deflated = zlib.deflateRawSync(data, { level: zlib.constants.Z_BEST_COMPRESSION });
+    return deflated.length < data.length ? { method: 8, payload: deflated } : { method: 0, payload: data };
+}
+
 function createZip(files, outputPath) {
     const now = getDosTime(new Date());
     const chunks = [];
     const centralChunks = [];
     let offset = 0;
+    let rawTotal = 0;
+    let storedTotal = 0;
 
     for (const file of files) {
         const data = fs.readFileSync(file.diskPath);
         const name = Buffer.from(file.zipPath.replace(/\\/g, '/'));
         const crc = crc32(data);
+        const { method, payload } = compressEntry(data);
+        rawTotal += data.length;
+        storedTotal += payload.length;
 
         const localHeader = Buffer.alloc(30);
         localHeader.writeUInt32LE(0x04034b50, 0);
         localHeader.writeUInt16LE(20, 4);
         localHeader.writeUInt16LE(0, 6);
-        localHeader.writeUInt16LE(0, 8);
+        localHeader.writeUInt16LE(method, 8);
         localHeader.writeUInt16LE(now.dosTime, 10);
         localHeader.writeUInt16LE(now.dosDate, 12);
         localHeader.writeUInt32LE(crc, 14);
-        localHeader.writeUInt32LE(data.length, 18);
+        localHeader.writeUInt32LE(payload.length, 18);
         localHeader.writeUInt32LE(data.length, 22);
         localHeader.writeUInt16LE(name.length, 26);
         localHeader.writeUInt16LE(0, 28);
 
-        chunks.push(localHeader, name, data);
+        chunks.push(localHeader, name, payload);
 
         const centralHeader = Buffer.alloc(46);
         centralHeader.writeUInt32LE(0x02014b50, 0);
         centralHeader.writeUInt16LE(20, 4);
         centralHeader.writeUInt16LE(20, 6);
         centralHeader.writeUInt16LE(0, 8);
-        centralHeader.writeUInt16LE(0, 10);
+        centralHeader.writeUInt16LE(method, 10);
         centralHeader.writeUInt16LE(now.dosTime, 12);
         centralHeader.writeUInt16LE(now.dosDate, 14);
         centralHeader.writeUInt32LE(crc, 16);
-        centralHeader.writeUInt32LE(data.length, 20);
+        centralHeader.writeUInt32LE(payload.length, 20);
         centralHeader.writeUInt32LE(data.length, 24);
         centralHeader.writeUInt16LE(name.length, 28);
         centralHeader.writeUInt16LE(0, 30);
@@ -103,7 +116,7 @@ function createZip(files, outputPath) {
         centralHeader.writeUInt32LE(offset, 42);
         centralChunks.push(centralHeader, name);
 
-        offset += localHeader.length + name.length + data.length;
+        offset += localHeader.length + name.length + payload.length;
     }
 
     const centralOffset = offset;
@@ -119,6 +132,44 @@ function createZip(files, outputPath) {
     endHeader.writeUInt16LE(0, 20);
 
     fs.writeFileSync(outputPath, Buffer.concat([...chunks, ...centralChunks, endHeader]));
+    return { rawTotal, storedTotal };
+}
+
+/** 生成后自检：按 central directory 逐条解压，校验 CRC 与原始字节一致。 */
+function verifyZip(zipPath, files) {
+    const buffer = fs.readFileSync(zipPath);
+    const endOffset = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+    if (endOffset < 0) throw new Error('zip 自检失败：找不到 end of central directory');
+    const entryCount = buffer.readUInt16LE(endOffset + 10);
+    if (entryCount !== files.length) throw new Error(`zip 自检失败：条目数 ${entryCount} != ${files.length}`);
+
+    let cursor = buffer.readUInt32LE(endOffset + 16);
+    for (let index = 0; index < entryCount; index++) {
+        if (buffer.readUInt32LE(cursor) !== 0x02014b50) throw new Error('zip 自检失败：central header 签名错误');
+        const method = buffer.readUInt16LE(cursor + 10);
+        const crc = buffer.readUInt32LE(cursor + 16);
+        const compressedSize = buffer.readUInt32LE(cursor + 20);
+        const uncompressedSize = buffer.readUInt32LE(cursor + 24);
+        const nameLength = buffer.readUInt16LE(cursor + 28);
+        const extraLength = buffer.readUInt16LE(cursor + 30);
+        const commentLength = buffer.readUInt16LE(cursor + 32);
+        const localOffset = buffer.readUInt32LE(cursor + 42);
+        const name = buffer.toString('utf8', cursor + 46, cursor + 46 + nameLength);
+
+        const localNameLength = buffer.readUInt16LE(localOffset + 26);
+        const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+        const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+        const payload = buffer.subarray(dataStart, dataStart + compressedSize);
+        const restored = method === 8 ? zlib.inflateRawSync(payload) : payload;
+
+        if (restored.length !== uncompressedSize) throw new Error(`zip 自检失败：${name} 解压后长度不符`);
+        if (crc32(restored) !== crc) throw new Error(`zip 自检失败：${name} CRC 不符`);
+        const expected = files.find((file) => file.zipPath.replace(/\\/g, '/') === name);
+        if (!expected) throw new Error(`zip 自检失败：${name} 不在预期文件列表中`);
+        if (!restored.equals(fs.readFileSync(expected.diskPath))) throw new Error(`zip 自检失败：${name} 内容与 dist 不一致`);
+
+        cursor += 46 + nameLength + extraLength + commentLength;
+    }
 }
 
 function collectDistScripts(dir, prefix = '') {
@@ -146,12 +197,17 @@ function main() {
 
     const zipName = `${sourcePackage.name}-${sourcePackage.version}.zip`;
     const zipPath = path.join(DIST_DIR, zipName);
-    createZip([
+    const entries = [
         ...collectDistScripts(DIST_DIR),
         { zipPath: 'package.json', diskPath: releasePackagePath },
-    ], zipPath);
+    ];
+    const { rawTotal, storedTotal } = createZip(entries, zipPath);
+    verifyZip(zipPath, entries);
 
+    const zipSize = fs.statSync(zipPath).size;
+    const ratio = rawTotal > 0 ? Math.round((1 - storedTotal / rawTotal) * 100) : 0;
     console.log(`已生成发布包：${path.relative(PACKAGE_ROOT, zipPath)}`);
+    console.log(`文件 ${entries.length} 个，原始 ${rawTotal} 字节 -> zip ${zipSize} 字节（deflate 压缩率 ${ratio}%，已通过解压自检）`);
 }
 
 main();

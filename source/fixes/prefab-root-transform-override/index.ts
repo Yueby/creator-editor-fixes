@@ -1,11 +1,18 @@
-import { debugLog, debugWarn } from '../../debug';
+import { debugLog, debugWarn, warnOnce } from '../../debug';
+import { getEditorVersion, isSupportedEditorVersion, SUPPORTED_EDITOR_VERSION } from '../../editor-version';
 
 const PACKAGE_NAME = 'creator-editor-fixes';
 const PATCHED_FLAG = '__prefabTransformOverrideFixerPatched__';
 const ORIGINAL_METHOD = '__prefabTransformOverrideFixerOriginal__';
 const PATCH_VERSION_FLAG = '__prefabTransformOverrideFixerPatchVersion__';
-const PATCH_VERSION = 'override-recording-v5';
+const PATCH_VERSION = 'override-recording-v6';
 const STATE_KEY = '__prefabTransformOverrideFixerState__';
+const OVERRIDE_LIST_KEY = 'propertyOverrides';
+const TRANSFORM_KEYS = ['_lpos', '_lrot', '_euler', '_lscale'];
+/** beginRecording / setNodeParent / endRecording / applyData / undo / redo */
+const EXPECTED_PATCH_COUNT = 6;
+/** applyData/undo/redo 的 promise 万一永不结束，兜底恢复计数，否则修复会被永久跳过。 */
+const APPLYING_RELEASE_TIMEOUT_MS = 30000;
 
 interface PatchRecord {
     target: any;
@@ -24,7 +31,6 @@ interface ListenerState {
     applyingDepth: number;
     sceneUndoManagerProto?: any;
     fixedCommandChildren?: WeakMap<any, string[]>;
-    recentChildUuids?: string[];
 }
 
 interface PatchedMethod extends Function {
@@ -41,7 +47,6 @@ function getState(): ListenerState {
     if (!state.patches) state.patches = [];
     if (typeof state.applyingDepth !== 'number') state.applyingDepth = 0;
     if (!state.fixedCommandChildren) state.fixedCommandChildren = new WeakMap<any, string[]>();
-    if (!state.recentChildUuids) state.recentChildUuids = [];
     return state;
 }
 
@@ -125,6 +130,17 @@ function removeUuid(uuids: any[], uuid: string): void {
     if (index >= 0) uuids.splice(index, 1);
 }
 
+/** set-parent 的 uuids 允许 string | string[]（CutNodeOptions），统一成字符串数组。 */
+function normalizeUuids(value: any): string[] {
+    if (Array.isArray(value)) return value.filter((uuid) => typeof uuid === 'string' && uuid.length > 0);
+    return typeof value === 'string' && value.length > 0 ? [value] : [];
+}
+
+/** 严格比较字符串数组，与引擎 prefab-info 里的 compareStringArray 语义一致。 */
+function isSameStringArray(value: any, expected: string[]): boolean {
+    return Array.isArray(value) && value.length === expected.length && expected.every((item, index) => value[index] === item);
+}
+
 /** 记录由本插件补入原始 set-parent command 的 prefab 根节点。 */
 function recordFixedCommandChild(command: any, childUuid: string): void {
     const state = getState();
@@ -136,9 +152,6 @@ function recordFixedCommandChild(command: any, childUuid: string): void {
         fixedCommandChildren.set(command, children);
     }
     if (!children.includes(childUuid)) children.push(childUuid);
-    state.recentChildUuids = (state.recentChildUuids || []).filter((uuid) => uuid !== childUuid);
-    state.recentChildUuids.unshift(childUuid);
-    if (state.recentChildUuids.length > 20) state.recentChildUuids.length = 20;
 }
 
 /** 仅调整本次 applyData 的 child-first 顺序，不改变 command 持久记录顺序。 */
@@ -255,44 +268,91 @@ function cloneEntryWithValue(entry: any, nextValue: any): any | null {
     return cloned;
 }
 
-/** 读取条目的 localID。 */
-function getEntryLocalId(entry: any): any {
-    const direct = readAnyField(entry, 'localID') || readAnyField(entry, 'localId');
-    if (direct) return direct;
+/** 读取条目的 localID，统一成字符串数组（引擎里 TargetInfo.localID 就是 string[]）。 */
+function getEntryLocalId(entry: any): string[] | null {
     const targetInfo = readAnyField(entry, 'targetInfo') || readAnyField(entry, 'target');
-    return readAnyField(targetInfo, 'localID') || readAnyField(targetInfo, 'localId');
+    const value = readAnyField(entry, 'localID') || readAnyField(entry, 'localId')
+        || readAnyField(targetInfo, 'localID') || readAnyField(targetInfo, 'localId');
+    if (Array.isArray(value)) return value;
+    return typeof value === 'string' && value.length > 0 ? [value] : null;
 }
 
-/** 判断条目是否指向当前 prefab 根节点 localID。 */
-function isEntryForLocalId(entry: any, fileId: string): boolean {
-    const localId = getEntryLocalId(entry);
-    if (localId === fileId) return true;
-    return Array.isArray(localId) && localId.includes(fileId);
-}
-
-/** 判断条目是否对应指定 Transform 字段。 */
-function isEntryForTransform(entry: any, transformKey: string): boolean {
+/** 读取条目的 propertyPath，统一成字符串数组。 */
+function getEntryPropertyPath(entry: any): string[] | null {
     for (const key of ['propertyPath', 'path', 'property', 'name']) {
         const value = readAnyField(entry, key);
-        if (value === transformKey) return true;
-        if (Array.isArray(value) && value.includes(transformKey)) return true;
+        if (Array.isArray(value)) return value;
+        if (typeof value === 'string' && value.length > 0) return [value];
     }
-    return false;
+    return null;
+}
+
+/**
+ * 判断条目是否正好指向当前 prefab 根节点自身的 localID。
+ * 用严格数组比较而不是 includes：嵌套 prefab 的 localID 是多级路径，
+ * 宽松匹配会命中内层节点的 override。
+ */
+function isEntryForLocalId(entry: any, fileId: string): boolean {
+    return isSameStringArray(getEntryLocalId(entry), [fileId]);
+}
+
+/**
+ * 判断条目是否正好对应指定 Transform 字段。
+ * 同样必须严格比较：['_lpos','x'] 这类分量级 override 不能被当成整条 _lpos，
+ * 否则会把 Vec3 写进一个 number 属性里。
+ */
+function isEntryForTransform(entry: any, transformKey: string): boolean {
+    return isSameStringArray(getEntryPropertyPath(entry), [transformKey]);
+}
+
+/** 获取 prefab 实例对象。 */
+function getPrefabInstance(child: any): any {
+    const prefab = readNodeField(child, '_prefab');
+    return prefab && prefab.instance;
 }
 
 /** 获取 prefab 实例上的已有覆盖列表。 */
 function getExistingOverrideList(child: any): any[] | null {
     const prefab = readNodeField(child, '_prefab');
     const instance = prefab && prefab.instance;
-    const listKey = 'property' + 'Overrides';
-    const list = readAnyField(instance, listKey) || readAnyField(prefab, listKey);
+    const list = readAnyField(instance, OVERRIDE_LIST_KEY) || readAnyField(prefab, OVERRIDE_LIST_KEY);
     return Array.isArray(list) ? list : null;
+}
+
+/**
+ * 优先用引擎自带的 EDITOR-only API 精确定位覆盖条目。
+ * PrefabInstance.findPropertyOverride 内部就是 compareStringArray，语义与序列化一致。
+ */
+function findOverrideEntryByEngine(instance: any, fileId: string, transformKey: string): any {
+    try {
+        const find = instance && instance.findPropertyOverride;
+        if (typeof find !== 'function') return null;
+        return find.call(instance, [fileId], [transformKey]) || null;
+    } catch (error) {
+        debugWarn(`[${PACKAGE_NAME}][${PATCH_VERSION}] findPropertyOverride 调用失败 key=${transformKey}: ${formatError(error)}`);
+        return null;
+    }
+}
+
+/** 定位 Transform 覆盖条目在列表中的下标，引擎 API 不可用时回退到严格比较。 */
+function findTransformEntryIndex(instance: any, list: any[], fileId: string, transformKey: string): number {
+    const engineEntry = findOverrideEntryByEngine(instance, fileId, transformKey);
+    if (engineEntry) {
+        const engineIndex = list.indexOf(engineEntry);
+        if (engineIndex >= 0) return engineIndex;
+    }
+    for (let index = 0; index < list.length; index++) {
+        const entry = list[index];
+        if (isEntryForLocalId(entry, fileId) && isEntryForTransform(entry, transformKey)) return index;
+    }
+    return -1;
 }
 
 /** 更新已有 Transform 覆盖条目，返回回滚记录。 */
 function updateExistingTransformEntries(child: any): Array<{ list: any[]; index: number; oldEntry: any }> {
     const prefab = readNodeField(child, '_prefab');
     const fileId = prefab && (prefab.fileId || prefab._fileId);
+    const instance = getPrefabInstance(child);
     const list = getExistingOverrideList(child);
     const rollback: Array<{ list: any[]; index: number; oldEntry: any }> = [];
     if (!fileId || !list) {
@@ -300,19 +360,17 @@ function updateExistingTransformEntries(child: any): Array<{ list: any[]; index:
         return rollback;
     }
 
-    for (const transformKey of ['_lpos', '_lrot', '_euler', '_lscale']) {
-        const sourceValue = readNodeField(child, transformKey);
-        let updated = false;
-        for (let index = 0; index < list.length; index++) {
-            const entry = list[index];
-            if (!isEntryForLocalId(entry, fileId) || !isEntryForTransform(entry, transformKey)) continue;
-            const nextEntry = cloneEntryWithValue(entry, cloneTransformValue(sourceValue));
-            if (!nextEntry) continue;
-            rollback.push({ list, index, oldEntry: entry });
-            list[index] = nextEntry;
-            updated = true;
+    for (const transformKey of TRANSFORM_KEYS) {
+        const index = findTransformEntryIndex(instance, list, fileId, transformKey);
+        if (index < 0) {
+            debugWarn(`[${PACKAGE_NAME}][${PATCH_VERSION}] 缺少已有 Transform 覆盖条目 child=${formatNode(child)} key=${transformKey}`);
+            continue;
         }
-        if (!updated) debugWarn(`[${PACKAGE_NAME}][${PATCH_VERSION}] 缺少已有 Transform 覆盖条目 child=${formatNode(child)} key=${transformKey}`);
+        const entry = list[index];
+        const nextEntry = cloneEntryWithValue(entry, cloneTransformValue(readNodeField(child, transformKey)));
+        if (!nextEntry) continue;
+        rollback.push({ list, index, oldEntry: entry });
+        list[index] = nextEntry;
     }
     return rollback;
 }
@@ -327,7 +385,7 @@ function syncExistingTransformOverrides(manager: any, command: any): void {
     const proto = state.sceneUndoManagerProto;
     const setRedo = proto && unwrapMethod(proto._setRedo);
     if (typeof setRedo !== 'function') {
-        debugWarn(`[${PACKAGE_NAME}][${PATCH_VERSION}] 跳过覆盖同步：未找到原始 _setRedo`);
+        warnOnce(`${PACKAGE_NAME}:missing-set-redo`, `[${PACKAGE_NAME}][${PATCH_VERSION}] 未找到原始 SceneUndoManager._setRedo，prefab 根节点 Transform override 同步已跳过`);
         return;
     }
 
@@ -457,7 +515,7 @@ function addChildUndoDump(manager: any, command: any, childUuid: string, child: 
     const proto = getState().sceneUndoManagerProto;
     const setUndo = proto && unwrapMethod(proto._setUndo);
     if (typeof setUndo !== 'function') {
-        debugWarn(`[${PACKAGE_NAME}][${PATCH_VERSION}] 跳过 prefab 根节点：未找到原始 _setUndo child=${formatNode(child)}`);
+        warnOnce(`${PACKAGE_NAME}:missing-set-undo`, `[${PACKAGE_NAME}][${PATCH_VERSION}] 未找到原始 SceneUndoManager._setUndo，prefab 根节点未能加入 set-parent 记录`);
         return false;
     }
 
@@ -491,8 +549,8 @@ function addChildUndoDump(manager: any, command: any, childUuid: string, child: 
 function patchSetNodeParentBefore(payload: any): void {
     const state = getState();
     if (state.applyingDepth > 0) return;
-    const uuids = payload && payload.uuids;
-    if (!Array.isArray(uuids) || uuids.length === 0) return;
+    const uuids = normalizeUuids(payload && payload.uuids);
+    if (uuids.length === 0) return;
     const manager = state.undoManager;
     if (!manager) {
         debugWarn(`[${PACKAGE_NAME}][${PATCH_VERSION}] 跳过 set-parent 修复：没有 active undo manager`);
@@ -506,7 +564,6 @@ function patchSetNodeParentBefore(payload: any): void {
 
     const addedNodes: string[] = [];
     for (const uuid of uuids) {
-        if (typeof uuid !== 'string' || !uuid) continue;
         const node = findNodeByUuid(uuid);
         if (!node || !isPrefabRoot(node)) continue;
         if (addChildUndoDump(manager, command, uuid, node)) addedNodes.push(formatNode(node));
@@ -518,7 +575,7 @@ function patchSetNodeParentBefore(payload: any): void {
 function installPatches(): void {
     const sceneRoot = getScenePackageRoot();
     if (!sceneRoot) {
-        debugWarn(`[${PACKAGE_NAME}][${PATCH_VERSION}] 未找到 sceneRoot`);
+        warnOnce(`${PACKAGE_NAME}:missing-scene-root`, `[${PACKAGE_NAME}][${PATCH_VERSION}] 未找到编辑器 scene 包路径，跳过安装`);
         return;
     }
     const path = require('path');
@@ -527,6 +584,14 @@ function installPatches(): void {
     const GeneralSceneFacade = getExport(generalFacadeModule, 'GeneralSceneFacade');
     const SceneUndoManager = getDataValue(undoSceneModule, 'SceneUndoManager');
     const SceneUndoCommand = getDataValue(undoSceneModule, 'SceneUndoCommand');
+    if (!GeneralSceneFacade || !SceneUndoManager || !SceneUndoCommand) {
+        warnOnce(
+            `${PACKAGE_NAME}:missing-internals`,
+            `[${PACKAGE_NAME}][${PATCH_VERSION}] 未找到编辑器内部实现，prefab 根节点 Transform override 修复未安装`
+            + ` facade=${!!GeneralSceneFacade} undoManager=${!!SceneUndoManager} undoCommand=${!!SceneUndoCommand}`,
+        );
+        return;
+    }
     const state = getState();
     state.sceneUndoManagerProto = SceneUndoManager && SceneUndoManager.prototype;
 
@@ -550,7 +615,10 @@ function installPatches(): void {
     });
 
     patchMethod(SceneUndoManager && SceneUndoManager.prototype, 'endRecording', (original) => function patchedEndRecording(this: any, ...args: any[]) {
-        const command = findActiveCommand(this);
+        // 只处理自己跟踪的那次 recording：auto command 与 manual command 交错时，
+        // 无条件清理会把真正在进行中的 recording 状态弄丢，导致后续修复静默失效。
+        const isActiveRecording = isValidRecordingId(state.recordingId) && args[0] === state.recordingId;
+        const command = isActiveRecording ? findActiveCommand(this) : null;
         try {
             const result = original.apply(this, args);
             if (command) {
@@ -563,31 +631,50 @@ function installPatches(): void {
             }
             return result;
         } finally {
-            clearActiveRecordingState();
+            if (isActiveRecording) clearActiveRecordingState();
         }
     });
 
     const callWithApplyingGuard = (original: (...args: any[]) => any, self: any, args: any[]) => {
         state.applyingDepth++;
+        let released = false;
+        const release = () => {
+            if (released) return;
+            released = true;
+            state.applyingDepth = Math.max(0, state.applyingDepth - 1);
+        };
+        const scheduleFallbackRelease = () => {
+            try {
+                const timer: any = setTimeout(() => {
+                    if (released) return;
+                    warnOnce(
+                        `${PACKAGE_NAME}:applying-guard-timeout`,
+                        `[${PACKAGE_NAME}][${PATCH_VERSION}] undo/redo 超过 ${APPLYING_RELEASE_TIMEOUT_MS}ms 未结束，已兜底恢复 applying 计数`,
+                    );
+                    release();
+                }, APPLYING_RELEASE_TIMEOUT_MS);
+                if (timer && typeof timer.unref === 'function') timer.unref();
+            } catch (_ignore) {
+                // 没有可用的 setTimeout 时忽略兜底。
+            }
+        };
         try {
             const result = original.apply(self, args);
             const then = getPromiseThen(result);
             if (typeof then === 'function') {
+                scheduleFallbackRelease();
                 try {
-                    const cleanupPromise = then.call(result,
-                        () => { state.applyingDepth--; },
-                        () => { state.applyingDepth--; },
-                    );
+                    const cleanupPromise = then.call(result, release, release);
                     if (cleanupPromise && typeof cleanupPromise.catch === 'function') cleanupPromise.catch(() => undefined);
                 } catch (_ignore) {
-                    state.applyingDepth--;
+                    release();
                 }
                 return result;
             }
-            state.applyingDepth--;
+            release();
             return result;
         } catch (error) {
-            state.applyingDepth--;
+            release();
             throw error;
         }
     };
@@ -601,11 +688,26 @@ function installPatches(): void {
     patchMethod(SceneUndoCommand && SceneUndoCommand.prototype, 'applyData', applyDataFactory);
     patchMethod(SceneUndoCommand && SceneUndoCommand.prototype, 'undo', applyingFactory);
     patchMethod(SceneUndoCommand && SceneUndoCommand.prototype, 'redo', applyingFactory);
+
+    if (state.patches.length < EXPECTED_PATCH_COUNT) {
+        warnOnce(
+            `${PACKAGE_NAME}:patch-count`,
+            `[${PACKAGE_NAME}][${PATCH_VERSION}] 部分编辑器内部 hook 未安装，prefab 根节点 Transform override 修复可能失效`
+            + ` installed=${state.patches.length}/${EXPECTED_PATCH_COUNT}`,
+        );
+    }
 }
 
 /** 安装编辑器内部 hook。 */
 export async function installEditorHooks(): Promise<void> {
     await uninstallEditorHooks();
+    if (!isSupportedEditorVersion()) {
+        warnOnce(
+            `${PACKAGE_NAME}:unsupported-version`,
+            `[${PACKAGE_NAME}][${PATCH_VERSION}] 跳过安装：仅适用于编辑器 ${SUPPORTED_EDITOR_VERSION}，当前 ${getEditorVersion() || 'unknown'}`,
+        );
+        return;
+    }
     const state = getState();
     state.installed = true;
     installPatches();

@@ -1,14 +1,17 @@
 {
     "package_version": 2,
     "name": "creator-editor-fixes",
-    "version": "1.0.13",
+    "version": "1.0.14",
     "author": "Yueby",
     "editor": ">=3.8.3",
     "scripts": {
         "build": "node ./scripts/clean-dist.js && tsc && node ./scripts/package-dist.js",
-        "watch": "tsc -w"
+        "build:debug": "node ./scripts/clean-dist.js && tsc -p tsconfig.debug.json && node ./scripts/package-dist.js",
+        "watch": "tsc -w -p tsconfig.debug.json",
+        "verify": "node ./scripts/verify-scene-fixes.js && node ./scripts/verify-inspector-i18n-listener-leak.js && node ./scripts/verify-editor-internals.js",
+        "check:refs": "node ./scripts/check-target-overrides.js"
     },
-    "description": "Cocos Creator 编辑器修复集合，包含 prefab 根节点 Transform override 同步修复与 Inspector i18n 监听泄漏修复。",
+    "description": "Cocos Creator 编辑器修复集合，包含 prefab 根节点 Transform override 同步修复、prefab 子节点锁定持久化与 Inspector i18n 监听泄漏修复。",
     "main": "./dist/main.js",
     "creator": {
         "hookScript": "./dist/fixes/inspector-i18n-listener-leak/hook.js"

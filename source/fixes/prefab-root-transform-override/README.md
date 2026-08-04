@@ -75,6 +75,26 @@ set-parent command
 
 其中第 7 步（同步已有 override）解决根因一（保存到场景文件的值），第 1–6、8–9 步（补 child、纳入原始 command、child-first apply）解决根因二（撤销/重做与视觉闪动）。
 
+## 条目定位为何必须严格匹配
+
+引擎在 `prefab-info.ts` 里判定一条 override 是不是目标，用的是 `compareStringArray`（等长逐元素全等）：
+
+```ts
+public isTarget (localID: string[], propPath: string[]): boolean | undefined {
+    return compareStringArray(this.targetInfo?.localID, localID)
+        && compareStringArray(this.propertyPath, propPath);
+}
+```
+
+`TargetInfo.localID` 是 `string[]` 而不是单个 fileId，因为嵌套 prefab 需要用多级路径定位；`propertyPath` 同样可以是 `['_lpos','x']` 这种分量级路径（`applyPropertyOverrides` 会 `pop()` 最后一级再逐级下钻）。
+
+所以条目定位不能用 `includes` 这类宽松匹配，否则：
+
+- `localID = ['OUTER', 'ROOT_FILE']`（嵌套 prefab 内层节点）会被当成当前根节点的条目。
+- `propertyPath = ['_lpos', 'x']`（number 属性）会被当成整条 `_lpos`，把 Vec3 写进一个分量里。
+
+当前实现优先调引擎自带的 EDITOR-only API `instance.findPropertyOverride([fileId], [transformKey])`，它内部就是上面的 `isTarget`；只在该 API 不可用时，才回退到自己实现的等价严格数组比较。
+
 ## 为什么只更新已有 Transform override
 
 本模块只更新 prefab 根节点已有的 Transform override 条目：
@@ -86,7 +106,7 @@ _euler
 _lscale
 ```
 
-如果某个条目不存在，只记录 debug warning，不主动创建新的 `PropertyOverrideInfo` / `TargetInfo`。
+如果某个条目不存在，只记录 debug warning，不主动创建新的 `PropertyOverrideInfo` / `TargetInfo`。换句话说，本修复的前提是“Creator 已经为该 prefab 实例建过 Transform override 条目，只是值是旧的”；若某个字段从未产生过 override，本模块不会为它新建条目。
 
 原因是 Creator 3.8.3 的 prefab override 序列化结构属于内部实现，手动创建缺失条目风险较高，可能破坏 prefab instance 序列化数据。当前安全边界是：
 
@@ -99,8 +119,16 @@ _lscale
 本模块运行在 scene 进程，当前 patch 版本：
 
 ```text
-override-recording-v5
+override-recording-v6
 ```
+
+v6 相对 v5 的变化：
+
+- `set-parent` 的 `uuids` 允许 `string | string[]`（`CutNodeOptions`，且 `set-parent` 是 public 消息），v5 只处理数组，传单字符串时修复会静默失效。
+- override 条目定位改为引擎 `findPropertyOverride` + 严格数组比较，v5 的 `includes` 会误伤嵌套 `localID` 与分量级 `propertyPath`。
+- `endRecording` 只处理 `args[0] === state.recordingId` 的那次 recording；v5 无条件清理状态，auto/manual command 交错时会把进行中的 recording 弄丢。
+- `applyData`/`undo`/`redo` 的 applying 计数增加超时兜底与不小于 0 的保护，避免一次未 settle 的 promise 就让修复永久被跳过。
+- 只在 `Editor.App.version === '3.8.3'` 时安装；关键安装失败（找不到内部实现、patch 数量不足、缺 `_setUndo`/`_setRedo`）不再只写 debug 日志，而是输出一次 warning。
 
 hook 的内部方法包括：
 
@@ -130,7 +158,22 @@ SceneUndoCommand.prototype.redo
 
 ## 验证方式
 
-建议使用一个带非默认 Transform 的父节点 `Parent`：
+自动校验（不需要安装 Creator，用假的 undo/facade 实现真跑 dist）：
+
+```bash
+npm run build
+node scripts/verify-scene-fixes.js
+```
+
+覆盖：uuids 传 string、已有 `_lpos` 条目被同步为节点实时值、克隆而不共享引用、嵌套 `localID` 与分量级 `propertyPath` 干扰条目不被改动、`redoData` 同步、child-first 顺序、`endRecording` 收到无关 id、uninstall 还原、版本守卫。
+
+内部 API 校验（需要本机 Creator 3.8.3）：
+
+```bash
+node scripts/verify-editor-internals.js
+```
+
+手工验证建议使用一个带非默认 Transform 的父节点 `Parent`：
 
 1. 将 prefab 实例根节点拖入 `Parent`。
 2. 保存并切换场景，确认位置不变。

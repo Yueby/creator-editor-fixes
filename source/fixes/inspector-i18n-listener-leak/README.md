@@ -107,10 +107,14 @@ contributions.inspector.type.node  = <本插件 node wrapper 绝对路径>
 3. wrapper 读取当前 Creator 3.8.3 安装目录中的原始 contribution 文件。
 4. 对原始源码做 exact string replacement。
 5. 每个 replacement 必须命中 exactly 1 次。
-6. 使用 `Module._compile` 在内存中编译 patched source。
+6. 使用 `Module._compile` 在内存中编译 patched source（`new Module(originalPath, module)`，不使用已弃用的 `module.parent`）。
 7. `filename` / `__dirname` 指向原始 engine 文件路径，保持相对 require 行为。
 8. 不覆盖 `require.cache[originalPath]`。
-9. 如果 patch 匹配失败，fail closed，回退加载原始模块。
+9. 如果 patch 匹配失败，fail closed，回退加载原始模块，并输出一次 `console.warn`（不受 DEBUG 开关影响），避免泄漏修复静默失效。
+
+## 已知限制
+
+本模块通过 `contributions.inspector.type.asset` / `type.node` 生效，与其它同样覆盖这两个 key 的扩展互斥（后加载者生效）。如果同时安装了其它接管 Inspector node/asset 面板的扩展，需要二选一。
 
 ## 为什么不用 runtime listener capture
 
@@ -148,6 +152,12 @@ node scripts/verify-inspector-i18n-listener-leak.js
 - 3.8.3 mock 会注入 wrapper。
 - 3.8.4 mock 不注入 wrapper。
 - `Editor.App.path = <CreatorRoot>\resources\app.asar` 时能正确定位原始 contribution 文件。
+
+还可以跑内部 API 校验，它会直接断言本机 3.8.3 的原始泄漏点仍然成立（`asset.js` 里 `i18n:change` 的 add 次数为 1、remove 为 0；`node.js` 的 bind 仍挂在模块级 `Elements.node` 上）：
+
+```bash
+node scripts/verify-editor-internals.js
+```
 
 ### 运行时验证
 

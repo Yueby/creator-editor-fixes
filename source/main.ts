@@ -38,9 +38,9 @@ async function readPrefabChildLockStates(): Promise<PrefabChildLockState> {
 }
 
 function savePrefabChildLockStates(sceneUuid: string, changes: any): Promise<void> {
+    if (typeof sceneUuid !== 'string' || !sceneUuid || !Array.isArray(changes)) return Promise.resolve();
     profileQueue = profileQueue.then(async () => {
         const profile = await readPrefabChildLockStates();
-        if (typeof sceneUuid !== 'string' || !sceneUuid || !Array.isArray(changes)) return;
         const scene = profile.scenes[sceneUuid] || (profile.scenes[sceneUuid] = {});
         for (const change of changes) {
             if (!change || typeof change.prefabRootFileId !== 'string' || typeof change.childFileId !== 'string' || typeof change.locked !== 'boolean') continue;
@@ -86,6 +86,16 @@ async function setSceneReadyState(isReady: boolean): Promise<void> {
     }
 }
 
+/** 卸载场景侧 hook，避免扩展被禁用/卸载后 patch 残留在 scene 进程里。 */
+async function uninstallSceneHooks(): Promise<void> {
+    try {
+        await executeSceneMethod('setSceneReadyState', false);
+        await executeSceneMethod('uninstallEditorHooks');
+    } catch (error) {
+        debugWarn(`[${PACKAGE_NAME}] 卸载场景 hook 失败:`, error);
+    }
+}
+
 export const methods: { [key: string]: (...args: any[]) => any } = {
     async getPrefabChildLockStates() {
         return readPrefabChildLockStates();
@@ -112,6 +122,6 @@ export function load() {
 }
 
 /** 扩展卸载时触发 */
-export function unload() {
-    setSceneReadyState(false);
+export async function unload() {
+    await uninstallSceneHooks();
 }
