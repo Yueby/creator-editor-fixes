@@ -7,12 +7,15 @@
 ```text
 prefab-root-transform-override
 prefab-child-lock-persistence
+prefab-active-override-sync
 inspector-i18n-listener-leak
 ```
 
 该模块修复 prefab 实例根节点在编辑器内调整父节点后，Transform override 保存、切换场景、撤销/重做状态不一致的问题。
 
 `prefab-child-lock-persistence` 让 prefab 实例内子节点的编辑器锁定状态（`LockedInEditor`）可以跨场景重载、跨编辑器重启保留，因为 Creator 原生不会把它序列化进场景。
+
+`prefab-active-override-sync` 修复用快捷键（`toggle-active-selected-node`）取消激活 prefab 实例内节点后，`active` 没有写入 `propertyOverrides`、保存后切换场景又恢复激活的问题。Inspector 勾选框走的是另一条路径，本来就正常。
 
 `inspector-i18n-listener-leak` 修复 Cocos Creator 3.8.3 Inspector 面板切换时 `i18n:change` 广播监听未随面板释放的问题，尤其可降低多材质 MeshRenderer 等 Inspector 反复打开后的内存增长。
 
@@ -65,10 +68,10 @@ contributions.inspector.type.node  -> dist/fixes/inspector-i18n-listener-leak/no
 扩展版本：
 
 ```text
-1.0.14
+1.0.15
 ```
 
-scene 进程的两个 hook 模块（`prefab-root-transform-override`、`prefab-child-lock-persistence`）只在 `Editor.App.version === '3.8.3'` 时安装；其它版本会输出一次 warning 后跳过，不会把 patch 打在未验证过的内部实现上。
+scene 进程的三个 hook 模块（`prefab-root-transform-override`、`prefab-child-lock-persistence`、`prefab-active-override-sync`）只在 `Editor.App.version === '3.8.3'` 时安装；其它版本会输出一次 warning 后跳过，不会把 patch 打在未验证过的内部实现上。
 
 ## 使用到的编辑器内部 hook
 
@@ -130,6 +133,9 @@ creator-editor-fixes/
 │     ├─ prefab-child-lock-persistence/      # prefab 子节点锁定持久化
 │     │  ├─ index.ts
 │     │  └─ README.md                        # 持久化方案与限制
+│     ├─ prefab-active-override-sync/        # 快捷键取消激活的 active override 同步
+│     │  ├─ index.ts
+│     │  └─ README.md                        # 根因与修复原理
 │     └─ inspector-i18n-listener-leak/       # Inspector i18n 监听泄漏修复
 │        ├─ hook.ts
 │        ├─ patcher.ts
@@ -151,13 +157,14 @@ creator-editor-fixes/
 │  ├─ fixes/
 │  │  ├─ prefab-root-transform-override/index.js
 │  │  ├─ prefab-child-lock-persistence/index.js
+│  │  ├─ prefab-active-override-sync/index.js
 │  │  └─ inspector-i18n-listener-leak/
 │  │     ├─ hook.js
 │  │     ├─ patcher.js
 │  │     ├─ asset.js
 │  │     └─ node.js
 │  ├─ package.json
-│  └─ creator-editor-fixes-1.0.14.zip
+│  └─ creator-editor-fixes-1.0.15.zip
 ├─ package.json
 ├─ package-lock.json
 └─ tsconfig.json
@@ -181,6 +188,7 @@ creator-editor-fixes/
 ```text
 source/fixes/prefab-root-transform-override/README.md
 source/fixes/prefab-child-lock-persistence/README.md
+source/fixes/prefab-active-override-sync/README.md
 source/fixes/inspector-i18n-listener-leak/README.md
 ```
 
@@ -222,7 +230,7 @@ npm run watch         # 监听模式同样用 tsconfig.debug.json
 构建产物：
 
 ```text
-dist/creator-editor-fixes-1.0.14.zip
+dist/creator-editor-fixes-1.0.15.zip
 ```
 
 zip 内包含：
@@ -234,6 +242,7 @@ debug.js
 editor-version.js
 fixes/prefab-root-transform-override/index.js
 fixes/prefab-child-lock-persistence/index.js
+fixes/prefab-active-override-sync/index.js
 fixes/inspector-i18n-listener-leak/hook.js
 fixes/inspector-i18n-listener-leak/patcher.js
 fixes/inspector-i18n-listener-leak/asset.js
@@ -276,7 +285,7 @@ undo/redo 超时未结束，applying 计数已兜底恢复
 在 Cocos Creator 扩展管理器中导入：
 
 ```text
-dist/creator-editor-fixes-1.0.14.zip
+dist/creator-editor-fixes-1.0.15.zip
 ```
 
 导入后重启或重载扩展，使 scene hook 生效。

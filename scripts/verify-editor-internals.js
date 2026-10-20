@@ -126,6 +126,13 @@ function verifySceneTypes(asar) {
     checkAll('general-scene-facade.d.ts', asar.read('builtin/scene/@types/cce/3d/facade/general-scene-facade.d.ts'), [
         /setNodeParent\(options: CutNodeOptions\): Promise<string\[\]>;/,
         /changeNodeLock\(uuids: string \| string\[\], locked: Boolean, loop: Boolean\): Promise<void>;/,
+        /toggleActiveSelectedNode\(\): void;/,
+        /protected _prefabMgr: /,
+    ]);
+
+    // fix4: PrefabManager 的节点变更通知入口
+    checkAll('manager/prefab/index.d.ts', asar.read('builtin/scene/@types/cce/3d/manager/prefab/index.d.ts'), [
+        /onNodeChangedInGeneralMode\(node: Node, opts: IChangeNodeOptions, root: Node \| Scene \| null\): void;/,
     ]);
 
     // fix1: set-parent payload 的 uuids 允许 string，normalizeUuids 因此必须兼容
@@ -221,6 +228,8 @@ function verifyDistFreshness() {
         ['fixes/prefab-root-transform-override/index.js', 'findPropertyOverride'],
         ['fixes/prefab-child-lock-persistence/index.js', 'prefab-child-lock-persistence-v5'],
         ['fixes/prefab-child-lock-persistence/index.js', 'getChildFileIdPath'],
+        ['fixes/prefab-active-override-sync/index.js', 'prefab-active-override-sync-v1'],
+        ['fixes/prefab-active-override-sync/index.js', 'onNodeChangedInGeneralMode'],
         ['main.js', 'uninstallEditorHooks'],
         ['editor-version.js', 'SUPPORTED_EDITOR_VERSION'],
         ['debug.js', 'warnOnce'],

@@ -1,4 +1,4 @@
-// scene 进程两个 hook 的离线冒烟测试：用假的编辑器内部实现（SceneUndoManager / SceneUndoCommand /
+// scene 进程三个 hook 的离线冒烟测试：用假的编辑器内部实现（SceneUndoManager / SceneUndoCommand /
 // GeneralSceneFacade / cce.Node / cce.Scene）真跑一遍 dist 产物，覆盖手工点编辑器很难稳定复现的分支。
 //
 // 用法：node scripts/verify-scene-fixes.js（不需要安装 Cocos Creator）
@@ -25,6 +25,16 @@ function check(condition, message) {
 
 const FAKE_FACADE_SOURCE = `
 class GeneralSceneFacade {
+    constructor() {
+        this._prefabMgr = GeneralSceneFacade.prefabMgr;
+    }
+    toggleActiveSelectedNode() {
+        GeneralSceneFacade.toggleCalls = (GeneralSceneFacade.toggleCalls || 0) + 1;
+        for (const uuid of GeneralSceneFacade.selected) {
+            const node = GeneralSceneFacade.nodes.get(uuid);
+            if (node) node.active = !node.active;
+        }
+    }
     async setNodeParent(options) {
         GeneralSceneFacade.lastOptions = options;
         return [];
@@ -33,6 +43,8 @@ class GeneralSceneFacade {
         GeneralSceneFacade.lastLock = { uuids, locked, loop };
     }
 }
+GeneralSceneFacade.selected = [];
+GeneralSceneFacade.nodes = new Map();
 exports.GeneralSceneFacade = GeneralSceneFacade;
 `;
 
@@ -173,6 +185,8 @@ const messageCalls = [];
 const lockCalls = [];
 let profileStub = { version: 1, scenes: {} };
 let sceneRootNode = null;
+let selectedUuids = [];
+const nodeChangeCalls = [];
 
 function indexTree(node) {
     if (!node) return;
@@ -182,6 +196,9 @@ function indexTree(node) {
 
 global.Editor = {
     App: { path: creatorRoot, version: '3.8.3' },
+    Selection: {
+        getSelected: () => selectedUuids.slice(),
+    },
     Message: {
         request: async (packageName, method, ...args) => {
             messageCalls.push({ packageName, method, args });
@@ -356,6 +373,48 @@ async function verifyChildLockFix() {
     check(!GeneralSceneFacade.prototype.changeNodeLock.__prefabChildLockPersistencePatched__, 'uninstall 后 changeNodeLock 已还原');
 }
 
+// ---------------------------------------------------------------- fix4
+
+async function verifyActiveOverrideSync() {
+    console.log('\n--- fix4 prefab-active-override-sync ---');
+
+    nodeIndex.clear();
+    nodeChangeCalls.length = 0;
+
+    const scene = makeNode('Scene', 'scene-uuid');
+    const plain = addChild(scene, makeNode('Plain', 'plain'));
+    const instanceRoot = addChild(scene, makeNode('InstanceRoot', 'instance-root'));
+    instanceRoot._prefab = { fileId: 'ROOT', instance: makePrefabInstance('INSTANCE', [], true) };
+    const inner = addChild(instanceRoot, makeNode('Inner', 'inner'));
+    inner._prefab = { fileId: 'INNER' };
+    for (const node of [plain, instanceRoot, inner]) node.active = true;
+    sceneRootNode = scene;
+    indexTree(scene);
+
+    GeneralSceneFacade.nodes = nodeIndex;
+    GeneralSceneFacade.prefabMgr = {
+        onNodeChangedInGeneralMode: (node, opts, root) => nodeChangeCalls.push({ uuid: node.uuid, opts, root }),
+    };
+
+    await sceneEntry.installEditorHooks();
+    check(GeneralSceneFacade.prototype.toggleActiveSelectedNode.__prefabActiveOverrideSyncPatched__ === true, 'toggleActiveSelectedNode 已被 hook');
+
+    const facade = new GeneralSceneFacade();
+    GeneralSceneFacade.selected = selectedUuids = ['plain', 'instance-root', 'inner'];
+    facade.toggleActiveSelectedNode();
+    check(GeneralSceneFacade.toggleCalls === 1 && !instanceRoot.active && !plain.active, '原方法照常执行，激活状态被切换');
+    check(nodeChangeCalls.length === 2, `只对 prefab 实例内的节点补发变更通知（实际 ${nodeChangeCalls.length} 次）`);
+    check(nodeChangeCalls.some((call) => call.uuid === 'instance-root'), '实例根节点被通知');
+    check(nodeChangeCalls.some((call) => call.uuid === 'inner'), '实例内部子节点被通知');
+    check(!nodeChangeCalls.some((call) => call.uuid === 'plain'), '普通节点不通知');
+    const call = nodeChangeCalls[0];
+    check(call.opts.propPath === 'active' && call.opts.record === false, '通知参数 propPath=active 且不记录 undo');
+    check(call.root === scene, 'root 取场景根节点');
+
+    await sceneEntry.uninstallEditorHooks();
+    check(!GeneralSceneFacade.prototype.toggleActiveSelectedNode.__prefabActiveOverrideSyncPatched__, 'uninstall 后 toggleActiveSelectedNode 已还原');
+}
+
 // ---------------------------------------------------------------- 版本守卫
 
 async function verifyVersionGuard() {
@@ -364,6 +423,7 @@ async function verifyVersionGuard() {
     await sceneEntry.installEditorHooks();
     check(!GeneralSceneFacade.prototype.setNodeParent.__prefabTransformOverrideFixerPatched__, '非 3.8.3 时不安装 fix1 hook');
     check(!GeneralSceneFacade.prototype.changeNodeLock.__prefabChildLockPersistencePatched__, '非 3.8.3 时不安装 fix3 hook');
+    check(!GeneralSceneFacade.prototype.toggleActiveSelectedNode.__prefabActiveOverrideSyncPatched__, '非 3.8.3 时不安装 fix4 hook');
     global.Editor.App.version = '3.8.3';
     await sceneEntry.uninstallEditorHooks();
 }
@@ -373,6 +433,7 @@ async function main() {
         await verifyTransformOverrideFix(true);
         await verifyTransformOverrideFix(false);
         await verifyChildLockFix();
+        await verifyActiveOverrideSync();
         await verifyVersionGuard();
     } finally {
         fs.rmSync(creatorRoot, { recursive: true, force: true });
